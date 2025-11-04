@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import numbers
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+import sys
+from typing import Dict, Tuple, Optional, Sequence
 
 try:
     import pandas as pd
@@ -23,6 +24,24 @@ except ImportError as exc:  # pragma: no cover - graceful CLI error
         "Install with `python -m pip install pandas openpyxl`."
     ) from exc
 
+try:  # Optional drag-and-drop support.
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:  # pragma: no cover - optional dependency
+    TkinterDnD = None
+    DND_FILES = None
+
+
+def resource_path(relative_name: str) -> Path:
+    """
+    Return the absolute path to a bundled resource.
+
+    PyInstaller sets `sys._MEIPASS` at runtime, so we resolve assets (e.g.,
+    courses.txt) relative to that folder when frozen, otherwise next to source.
+    """
+
+    base = getattr(sys, "_MEIPASS", Path(__file__).parent)
+    return (Path(base) / relative_name).resolve()
+
 
 @dataclass
 class TransformOptions:
@@ -30,6 +49,7 @@ class TransformOptions:
 
     uppercase_headers: bool = False
     drop_empty_rows: bool = False
+    course_file: Optional[Path] = None
 
 
 def normalize_excel_date(value: object) -> Optional[pd.Timestamp]:
@@ -50,7 +70,9 @@ def normalize_excel_date(value: object) -> Optional[pd.Timestamp]:
     return ts if not pd.isna(ts) else None
 
 
-def build_course_assignment(roster: pd.DataFrame) -> pd.DataFrame:
+def build_course_assignment(
+    roster: pd.DataFrame, course_names: Sequence[str] | None = None
+) -> pd.DataFrame:
     """Produce the matrix used on the CourseAssignment sheet."""
 
     required = ["LocName", "Course Name", "JobStatus", "Start Date", "End Date"]
@@ -86,7 +108,18 @@ def build_course_assignment(roster: pd.DataFrame) -> pd.DataFrame:
     working["summary"] = working.apply(render_row, axis=1)
     working = working[working["summary"].astype(bool)]
 
+    normalized_courses = [
+        name.strip() for name in (course_names or []) if name and name.strip()
+    ]
+    course_filter: set[str] = set(normalized_courses)
+    if course_filter:
+        working = working[working["Course Name"].isin(course_filter)]
+        # Preserve the order from the text file while removing duplicates.
+        normalized_courses = list(dict.fromkeys(normalized_courses))
+
     if working.empty:
+        if normalized_courses:
+            return pd.DataFrame({"Course Name": normalized_courses})
         return pd.DataFrame(columns=["Course Name"])
 
     course_order = working["Course Name"].drop_duplicates()
@@ -98,7 +131,10 @@ def build_course_assignment(roster: pd.DataFrame) -> pd.DataFrame:
         .unstack(fill_value="")
     )
 
-    pivot = pivot.reindex(course_order, axis=0)
+    if normalized_courses:
+        pivot = pivot.reindex(normalized_courses, axis=0)
+    else:
+        pivot = pivot.reindex(course_order, axis=0)
     pivot = pivot.reindex(location_order, axis=1)
 
     # Fill any missing columns introduced by reindex.
@@ -127,8 +163,27 @@ def default_output_path(source: Path, directory: Optional[Path] = None) -> Path:
     return (base_dir / timestamped_output_name(source)).resolve()
 
 
+def read_course_list(course_file: Path) -> list[str]:
+    """Load course names from a newline-delimited text file."""
+
+    try:
+        lines = course_file.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Course list not found at {course_file}. Provide a courses.txt file."
+        ) from exc
+
+    courses = [line.strip() for line in lines if line.strip()]
+    if not courses:
+        raise ValueError(f"No course names found inside {course_file}.")
+
+    return courses
+
+
 def convert_workbook(
-    source: Path, destination: Path, options: TransformOptions | None = None
+    source: Path,
+    destination: Path,
+    options: TransformOptions | None = None,
 ) -> None:
     """
     Read every sheet from `source` and write to `destination`.
@@ -154,11 +209,51 @@ def convert_workbook(
         roster.columns = [str(col).upper() for col in roster.columns]
 
     assignment_sheet_name = "CourseAssignment"
-    course_assignments = build_course_assignment(roster)
+    course_file = options.course_file or resource_path("courses.txt")
+    course_names = read_course_list(course_file)
+
+    course_assignments = build_course_assignment(roster, course_names)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(destination, engine="openpyxl") as writer:
         course_assignments.to_excel(writer, sheet_name=assignment_sheet_name, index=False)
+        worksheet = writer.sheets[assignment_sheet_name]
+        autosize_worksheet_columns(worksheet)
+
+
+def autosize_worksheet_columns(worksheet, min_width: int = 8, max_width: int = 60, padding: int = 2) -> None:
+    """
+    Grow each column so it fits the longest line of text, capped within bounds.
+
+    Args:
+        worksheet: The openpyxl worksheet to resize.
+        min_width: Lower bound to keep headers readable.
+        max_width: Upper bound to avoid excessively wide columns.
+        padding: Extra characters to add for breathing room.
+    """
+
+    for column_cells in worksheet.columns:
+        header_cell = column_cells[0]
+        column_letter = header_cell.column_letter
+        max_length = 0
+
+        for cell in column_cells:
+            value = cell.value
+            if value is None:
+                continue
+
+            text = str(value).strip()
+            if not text:
+                continue
+
+            longest_line = max((len(line) for line in text.splitlines()), default=0)
+            max_length = max(max_length, longest_line)
+
+        if max_length == 0:
+            continue
+
+        target_width = min(max_width, max(min_width, max_length + padding))
+        worksheet.column_dimensions[column_letter].width = target_width
 
 
 def prompt_directory(kind: str, default_path: Optional[Path] = None) -> Path:
@@ -249,6 +344,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drop rows that are entirely empty across all columns.",
     )
     parser.add_argument(
+        "--courses",
+        help="Path to the courses.txt file (defaults to the copy next to the script).",
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Launch a simple Tk interface with file pickers.",
@@ -257,9 +356,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_cli(args: argparse.Namespace) -> None:
+    course_path = Path(args.courses).expanduser().resolve() if args.courses else None
     options = TransformOptions(
         uppercase_headers=args.uppercase_headers,
         drop_empty_rows=args.drop_empty_rows,
+        course_file=course_path,
     )
 
     if args.input:
@@ -282,11 +383,26 @@ def run_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
-    root = tk.Tk()
+    root_cls = TkinterDnD.Tk if TkinterDnD else tk.Tk
+    root = root_cls()
     root.title("Excel Converter")
-    root.geometry("420x200")
 
-    state = {"input": "", "output": ""}
+    # Enlarge widgets ~3x for readability (slightly smaller than previous pass).
+    base_font = ("Segoe UI", 28)
+    button_font = ("Segoe UI", 26)
+
+    default_courses = resource_path("courses.txt")
+    state = {
+        "input": "",
+        "output": "",
+        "courses": str(default_courses) if default_courses.exists() else "",
+    }
+
+    def set_input_path(path: str) -> None:
+        state["input"] = path
+        state["output"] = str(default_output_path(Path(path)))
+        input_var.set(path)
+        output_var.set(state["output"])
 
     def choose_input() -> None:
         path = filedialog.askopenfilename(
@@ -294,18 +410,30 @@ def run_gui() -> None:
             filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")],
         )
         if path:
-            state["input"] = path
-            state["output"] = str(default_output_path(Path(path)))
-            input_var.set(path)
-            output_var.set(state["output"])
+            set_input_path(path)
+
+    def choose_courses() -> None:
+        path = filedialog.askopenfilename(
+            title="Select courses.txt file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            state["courses"] = path
+            courses_var.set(path)
 
     def do_convert() -> None:
         try:
             if not state["input"]:
-                raise FileNotFoundError
-            convert_workbook(Path(state["input"]), Path(state["output"]))
-        except FileNotFoundError:
-            messagebox.showerror("Missing file", "Choose an input workbook first.")
+                raise FileNotFoundError("Choose an input workbook first.")
+            if not state["courses"]:
+                raise FileNotFoundError("Choose a courses.txt file first.")
+            convert_workbook(
+                Path(state["input"]),
+                Path(state["output"]),
+                TransformOptions(course_file=Path(state["courses"])),
+            )
+        except FileNotFoundError as exc:
+            messagebox.showerror("Missing file", str(exc))
         except Exception as exc:  # pragma: no cover - UI convenience
             messagebox.showerror("Conversion failed", str(exc))
         else:
@@ -314,14 +442,49 @@ def run_gui() -> None:
     input_var = tk.StringVar()
     output_var = tk.StringVar()
 
-    tk.Label(root, text="Input workbook").pack(anchor="w", padx=12, pady=(12, 0))
-    tk.Entry(root, textvariable=input_var, width=50).pack(anchor="w", padx=12)
-    tk.Button(root, text="Browse…", command=choose_input).pack(anchor="w", padx=12, pady=(0, 8))
+    courses_var = tk.StringVar(value=state["courses"])
 
-    tk.Label(root, text="Output workbook (auto-generated)").pack(anchor="w", padx=12, pady=(4, 0))
-    tk.Entry(root, textvariable=output_var, width=50, state="readonly").pack(anchor="w", padx=12)
+    def handle_drop(path: str, target: str) -> None:
+        expanded = Path(path.strip("{}")).expanduser()
+        if not expanded.exists():
+            return
+        if target == "input" and expanded.is_file():
+            set_input_path(str(expanded))
+        elif target == "courses" and expanded.is_file():
+            state["courses"] = str(expanded)
+            courses_var.set(state["courses"])
 
-    tk.Button(root, text="Convert", command=do_convert).pack(pady=8)
+    def register_dnd(widget, target: str) -> None:
+        if not (TkinterDnD and DND_FILES):
+            return
+
+        def _on_drop(event):
+            paths = widget.tk.splitlist(event.data)
+            if paths:
+                handle_drop(paths[0], target)
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", _on_drop)
+
+    tk.Label(root, text="Input workbook", font=base_font).pack(anchor="w", padx=24, pady=(24, 0))
+    input_entry = tk.Entry(root, textvariable=input_var, font=base_font)
+    input_entry.pack(anchor="w", padx=24, fill="x")
+    register_dnd(input_entry, "input")
+    tk.Button(root, text="Browse…", command=choose_input, font=button_font).pack(anchor="w", padx=24, pady=(0, 16))
+
+    tk.Label(root, text="Courses list (courses.txt)", font=base_font).pack(anchor="w", padx=24, pady=(12, 0))
+    courses_entry = tk.Entry(root, textvariable=courses_var, font=base_font)
+    courses_entry.pack(anchor="w", padx=24, fill="x")
+    register_dnd(courses_entry, "courses")
+    tk.Button(root, text="Browse…", command=choose_courses, font=button_font).pack(anchor="w", padx=24, pady=(0, 16))
+
+    tk.Label(root, text="Output workbook (auto-generated)", font=base_font).pack(anchor="w", padx=24, pady=(12, 0))
+    tk.Entry(root, textvariable=output_var, state="readonly", font=base_font).pack(anchor="w", padx=24, fill="x")
+
+    tk.Button(root, text="Convert", command=do_convert, font=button_font, width=10).pack(pady=24)
+
+    # Resize the window just large enough to contain the enlarged widgets.
+    root.update_idletasks()
+    root.minsize(root.winfo_width(), root.winfo_height())
 
     root.mainloop()
 
@@ -329,6 +492,10 @@ def run_gui() -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # When bundled (e.g., via PyInstaller), default to the GUI if no CLI args.
+    if getattr(sys, "frozen", False) and not any((args.gui, args.input, args.output)):
+        args.gui = True
 
     if args.gui:
         run_gui()
