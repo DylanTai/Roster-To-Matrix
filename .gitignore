@@ -1,0 +1,23 @@
+# Bytecode caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Build artifacts
+build/
+
+# Information
+*.xlsx
+*.txt
+~$*
+
+# Logs / misc
+*.spec
+*.log
+
+# Project files to keep tracked
+!README.md
+!excel_converter.py
+!requirements.txt
