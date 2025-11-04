@@ -89,6 +89,11 @@ automatically using the timestamped naming convention. Use the second
 installed) to pick the `courses.txt` file, then press **Convert**. A message box
 confirms success or shows any errors (missing files, locked workbook, etc.).
 
+> Drag-and-drop is available when you run the script directly with Python on
+> macOS (after installing `tkinterdnd2`). The bundled `.app` disables TkinterDnD
+> because the native `libtkdnd` binary crashes inside a PyInstaller build, so
+> the UI reverts to the standard file pickers there.
+
 ## Build a standalone app
 
 To ship a double-clickable executable, package the script with PyInstaller. You

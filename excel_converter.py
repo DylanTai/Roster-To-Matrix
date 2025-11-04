@@ -27,9 +27,14 @@ except ImportError as exc:  # pragma: no cover - graceful CLI error
 
 try:  # Optional drag-and-drop support.
     from tkinterdnd2 import DND_FILES, TkinterDnD
-except ImportError:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - optional dependency
     TkinterDnD = None
     DND_FILES = None
+else:
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        # TkinterDnD segfaults when bundled on macOS; fall back to vanilla Tk.
+        TkinterDnD = None
+        DND_FILES = None
 
 
 def resource_path(relative_name: str) -> Path:
@@ -384,8 +389,26 @@ def run_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
-    root_cls = TkinterDnD.Tk if TkinterDnD else tk.Tk
-    root = root_cls()
+    dnd_available = bool(TkinterDnD and DND_FILES)
+    if TkinterDnD:
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:
+            dnd_available = False
+            ghost = tk._default_root
+            if ghost is not None:
+                try:
+                    ghost.destroy()
+                except tk.TclError:
+                    pass
+            tk._default_root = None
+            root = tk.Tk()
+            try:
+                root.tk.call("package", "forget", "tkdnd")
+            except tk.TclError:
+                pass
+    else:
+        root = tk.Tk()
     root.title("Excel Converter")
 
     # Enlarge widgets ~3x for readability (slightly smaller than previous pass).
@@ -483,7 +506,7 @@ def run_gui() -> None:
             courses_var.set(state["courses"])
 
     def register_dnd(widget, target: str) -> None:
-        if not (TkinterDnD and DND_FILES):
+        if not dnd_available:
             return
 
         def _on_drop(event):
