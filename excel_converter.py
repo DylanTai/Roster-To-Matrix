@@ -15,6 +15,7 @@ import numbers
 from pathlib import Path
 import sys
 from typing import Dict, Tuple, Optional, Sequence
+from urllib.parse import unquote, urlparse
 
 try:
     import pandas as pd
@@ -444,9 +445,36 @@ def run_gui() -> None:
 
     courses_var = tk.StringVar(value=state["courses"])
 
+    def normalize_drop(raw: str) -> Optional[Path]:
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            cleaned = cleaned[1:-1]
+
+        if cleaned.startswith("file://"):
+            try:
+                parsed = urlparse(cleaned)
+            except ValueError:
+                return None
+            path_part = unquote(parsed.path or "")
+            if not path_part:
+                return None
+            if sys.platform.startswith("win") and path_part.startswith("/"):
+                path_part = path_part.lstrip("/")
+                if parsed.netloc:
+                    path_part = f"{parsed.netloc}:{path_part}"
+            cleaned = path_part
+
+        try:
+            return Path(cleaned).expanduser()
+        except Exception:
+            return None
+
     def handle_drop(path: str, target: str) -> None:
-        expanded = Path(path.strip("{}")).expanduser()
-        if not expanded.exists():
+        expanded = normalize_drop(path)
+        if not expanded or not expanded.exists():
             return
         if target == "input" and expanded.is_file():
             set_input_path(str(expanded))
