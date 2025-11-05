@@ -37,6 +37,9 @@ else:
         DND_FILES = None
 
 
+SUPPORTED_EXCEL_SUFFIXES = {".xlsx", ".xlsm"}
+
+
 def resource_path(relative_name: str) -> Path:
     """
     Return the absolute path to a bundled resource.
@@ -203,10 +206,25 @@ def convert_workbook(
     source = source.expanduser().resolve()
     destination = destination.expanduser().resolve()
 
+    source_suffix = source.suffix.lower()
+    if source_suffix not in SUPPORTED_EXCEL_SUFFIXES:
+        raise ValueError(
+            f"Unsupported Excel format: {source_suffix}. Provide a .xlsx or .xlsm workbook."
+        )
+
+    dest_suffix = destination.suffix.lower()
+    if dest_suffix not in SUPPORTED_EXCEL_SUFFIXES:
+        destination = destination.with_suffix(".xlsx")
+        dest_suffix = destination.suffix.lower()
+    elif dest_suffix == ".xlsm":
+        # We do not preserve VBA projects, so always emit a standard workbook.
+        destination = destination.with_suffix(".xlsx")
+        dest_suffix = destination.suffix.lower()
+
     if not source.exists():
         raise FileNotFoundError(f"Input file not found: {source}")
 
-    roster = pd.read_excel(source, sheet_name=0)
+    roster = pd.read_excel(source, sheet_name=0, engine="openpyxl")
 
     if options.drop_empty_rows:
         roster.dropna(how="all", inplace=True)
@@ -221,6 +239,7 @@ def convert_workbook(
     course_assignments = build_course_assignment(roster, course_names)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+
     with pd.ExcelWriter(destination, engine="openpyxl") as writer:
         course_assignments.to_excel(writer, sheet_name=assignment_sheet_name, index=False)
         worksheet = writer.sheets[assignment_sheet_name]
@@ -387,7 +406,7 @@ def run_cli(args: argparse.Namespace) -> None:
 
 def run_gui() -> None:
     import tkinter as tk
-    from tkinter import filedialog, messagebox
+    from tkinter import filedialog, messagebox, font as tkfont
 
     dnd_available = bool(TkinterDnD and DND_FILES)
     if TkinterDnD:
@@ -411,9 +430,10 @@ def run_gui() -> None:
         root = tk.Tk()
     root.title("Excel Converter")
 
-    # Enlarge widgets ~3x for readability (slightly smaller than previous pass).
-    base_font = ("Segoe UI", 28)
-    button_font = ("Segoe UI", 26)
+    base_font = tkfont.Font(family="Segoe UI", size=12)
+    button_font = tkfont.Font(family="Segoe UI", size=12)
+    base_font_size = base_font.cget("size")
+    button_font_size = button_font.cget("size")
 
     default_courses = resource_path("courses.txt")
     state = {
@@ -533,9 +553,48 @@ def run_gui() -> None:
 
     tk.Button(root, text="Convert", command=do_convert, font=button_font, width=10).pack(pady=24)
 
-    # Resize the window just large enough to contain the enlarged widgets.
     root.update_idletasks()
-    root.minsize(root.winfo_width(), root.winfo_height())
+    baseline_width = max(root.winfo_width(), 1)
+    baseline_height = max(root.winfo_height(), 1)
+
+    resize_state: Dict[str, Optional[object]] = {"job": None, "size": (baseline_width, baseline_height)}
+
+    def apply_font_scale(width: int, height: int) -> None:
+        scale_w = width / baseline_width
+        scale_h = height / baseline_height
+        if scale_w >= 1 and scale_h >= 1:
+            scale = max(scale_w, scale_h)
+        else:
+            scale = 1.0
+        new_base = max(base_font_size, int(round(base_font_size * scale)))
+        new_button = max(button_font_size, int(round(button_font_size * scale)))
+        if base_font.cget("size") != new_base:
+            base_font.configure(size=new_base)
+        if button_font.cget("size") != new_button:
+            button_font.configure(size=new_button)
+
+    def on_configure(event) -> None:
+        if event.widget is not root:
+            return
+
+        width = max(event.width, 1)
+        height = max(event.height, 1)
+        existing = resize_state["job"]
+        if existing is not None:
+            root.after_cancel(existing)
+
+        resize_state["size"] = (width, height)
+
+        def finalize():
+            resize_state["job"] = None
+            size = resize_state["size"]
+            if isinstance(size, tuple):
+                apply_font_scale(size[0], size[1])
+
+        resize_state["job"] = root.after(80, finalize)
+
+    root.bind("<Configure>", on_configure)
+    root.minsize(baseline_width, baseline_height)
 
     root.mainloop()
 
